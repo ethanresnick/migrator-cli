@@ -1,0 +1,32 @@
+{
+  "name": "@ethanresnick/migrator",
+  "version": "1.0.1",
+  "type": "module",
+  "bin": {
+    "migrator": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "exports": {
+    "./types.js": {
+      "types": "./dist/types.d.ts"
+    }
+  },
+  "dependencies": {
+    "glob": "^7.2.0",
+    "umzug": "^3.0.0",
+    "yargs": "^16.2.0"
+  },
+  "devDependencies": {
+    "@types/glob": "^8.1.0",
+    "@types/umzug": "^2.3.3",
+    "@types/yargs": "^17.0.24",
+    "dotenv": "^16.0.0",
+    "typescript": "^5.2.2"
+  },
+  "files": [
+    "dist"
+  ]
+}
