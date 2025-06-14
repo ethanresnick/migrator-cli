@@ -1,6 +1,6 @@
 {
   "name": "@ethanresnick/migrator",
-  "version": "1.0.1",
+  "version": "1.2.0",
   "type": "module",
   "bin": {
     "migrator": "./dist/cli.js"
@@ -10,8 +10,9 @@
     "prepublishOnly": "npm run build"
   },
   "exports": {
-    "./types.js": {
-      "types": "./dist/types.d.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
   "dependencies": {

@@ -22,30 +22,36 @@ export type DatabaseConfig<
    * isn't specified explicitly.
    */
   readonly defaultScriptFormat: SupportedScriptFormat;
+
   /**
    * A list of supported file extensions for this db's scripts (no leading dot).
    */
   readonly supportedScriptFormats: readonly SupportedScriptFormat[];
+
   /**
    * The directory in which the migrator will look for this db's scripts and
    * into which it'll create new scripts.
    */
   readonly scriptsDirectory: string;
+
   /**
    * Creates this db to with an initial state and then closes any open
    * connections/resources. This should throw if the db already exists.
    */
   prepareDbAndDisconnect(): Promise<void>;
+
   /**
    * Deletes this db and then closes any open connections/resources.
    */
   dropDbAndDisconnect(): Promise<void>;
+
   /**
    * Returns an object capable of recording that a script has been run, listing
    * the scripts that have run, and removing the record of a script (if it's
    * rolled back).
    */
   createStorage(): UmzugStorage<ContextType>;
+
   /**
    * Takes the name and path of a script and turns it into a runnable object
    * that has an `up` and (optionally) `down` method. `up` and `down` will be
@@ -55,12 +61,14 @@ export type DatabaseConfig<
   resolveScript(
     params: MigrationParams<ContextType> & { path: string }
   ): RunnableMigration<ContextType>;
+
   /**
    * Returns a "context" object, which is simply an object that'll be passed to
    * all scripts. Often this context object is an instance of the db driver
    * connected to the database.
    */
   createContext(): ContextType | Promise<ContextType>;
+
   /**
    * A function that destroys the context object and cleans up associated
    * resources. This is called after all the migrations have been run with the

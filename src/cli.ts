@@ -13,14 +13,26 @@ const globAsync = promisify(glob);
 
 const dbs = await (async (): Promise<{ [k: string]: DatabaseConfig }> => {
   try {
-    return await import(path.resolve(process.cwd(), ".migrator.config.mjs"));
+    const { default: config } = await import(
+      path.resolve(process.cwd(), "./.migrator.config.mjs")
+    );
+    return config.databases;
   } catch (e) {
+    if ((e as any)?.code != "ERR_MODULE_NOT_FOUND") {
+      throw e;
+    }
+
     try {
-      return await import(path.resolve(process.cwd(), ".migrator.config.js"));
-    } catch (e) {
-      throw new Error(
-        "Could not find .migrator.config.mjs or .migrator.config.js in current directory"
+      const { default: config } = await import(
+        path.resolve(process.cwd(), "./.migrator.config.js")
       );
+      return config.databases;
+    } catch (e) {
+      throw (e as any)?.code != "ERR_MODULE_NOT_FOUND"
+        ? e
+        : new Error(
+            "Could not find .migrator.config.mjs or .migrator.config.js in current directory"
+          );
     }
   }
 })();
