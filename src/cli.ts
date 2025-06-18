@@ -4,7 +4,7 @@ import path from "path";
 import { promisify } from "util";
 
 import { Umzug } from "umzug";
-import yargs from "yargs";
+import yargs, { type Options } from "yargs";
 
 import type { DatabaseConfig } from "./DatabaseConfig.js";
 import { nameScript, scriptTypes, shouldRun } from "./script-generator.js";
@@ -39,20 +39,20 @@ const dbs = await (async (): Promise<{ [k: string]: DatabaseConfig }> => {
 
 const dbOpt = {
   alias: "database",
-  describe: "The database(s) to run migration against",
-  type: "array",
-  choices: Object.keys(dbs),
+  describe: "The database to run against",
+  type: "string",
+  choices: Object.keys(dbs) as (keyof typeof dbs & string)[],
   required: true,
-} as const;
+} as const satisfies Options;
 
 const envOpt = {
   alias: "environment",
   describe:
     "Environment you're creating a seed for or running the migrations/seeds " +
-    "in (effects which/whether seeds are run and how generated files are named).",
+    "in. This affects which/whether seeds are run and how generated files are named.",
   type: "string",
-  choices: ["staging", "prod", "demo"],
-} as const;
+  requiresArg: true,
+} as const satisfies Options;
 
 const formatOpt = {
   alias: "format",
@@ -101,9 +101,10 @@ yargs(process.argv.slice(2))
             );
           }
 
-          const db = dbs[opts.db];
-          if (!db) {
-            throw new Error(`Database "${opts.db}" not configured`);
+          const db = dbs[opts.db]!;
+          const env = getEnv(opts);
+          if (env && !db.supportedEnvironments.includes(env)) {
+            throw makeInvalidEnvironmentError(db, env);
           }
 
           if (
@@ -118,13 +119,15 @@ yargs(process.argv.slice(2))
           return true;
         }, false);
     },
-    async handler({ db, name, type, env, format: formatOptValue }) {
-      const dbConfig = dbs[db];
-      if (!dbConfig) {
-        throw new Error(`Database "${db}" not configured`);
-      }
-
-      const { defaultScriptFormat, getTemplate, scriptsDirectory } = dbConfig;
+    async handler({
+      db,
+      name,
+      type,
+      env: envOptValue,
+      format: formatOptValue,
+    }) {
+      const { defaultScriptFormat, getTemplate, scriptsDirectory } = dbs[db]!;
+      const env = getEnv({ db, env: envOptValue });
 
       // Umzug couples together script creation and running into one class,
       // presumaly to support the `verify` behavior mentioned below, so we have
@@ -165,9 +168,8 @@ yargs(process.argv.slice(2))
       "all that haven't been applied to the db yet.",
     builder: (yargs) => {
       return yargs
-        .option("env", envOpt)
+        .option("env", { ...envOpt, demand: true })
         .option("db", dbOpt)
-        .demandOption("env")
         .positional("target", {
           choices: ["remaining", "next", "only", "until"],
           default: "remaining",
@@ -178,7 +180,9 @@ yargs(process.argv.slice(2))
           type: "string",
           demandOption: false,
         })
-        .check(({ target, name }) => {
+        .check(({ target, name, db: dbName, env: envOptValue }) => {
+          const db = dbs[dbName]!;
+
           const needsSpecificScript = target === "only" || target === "until";
           if (!needsSpecificScript && name) {
             throw new Error(
@@ -193,162 +197,187 @@ yargs(process.argv.slice(2))
                 "apply (only or up to) a specific script."
             );
           }
+
+          const env = getEnv({ db: dbName, env: envOptValue });
+
+          if (!db.supportedEnvironments.includes(env)) {
+            throw makeInvalidEnvironmentError(db, env);
+          }
+
           return true;
         });
     },
-    handler: async function ({ target, name, env, db: optDbs }) {
-      const migrationTasks = Object.entries(dbs)
-        .filter(([dbName, _]) => (optDbs ?? []).includes(dbName))
-        .map(([_, db]) => async () => {
-          const { scriptsDirectory, supportedScriptFormats } = db;
+    handler: async function ({ target, name, env: envOptValue, db: dbName }) {
+      const db = dbs[dbName]!;
 
-          // Every database can (and will) define a different context type. TS
-          // just types this return type as the intersection of all the possible
-          // context types, which isn't meaningful; what we want instead is for it
-          // to track that, for this particular db, there's some context type that
-          // matches the type expected by this particular db's resolveMigrations()
-          // function, but TS can't do that, so we cast to any. To do this more
-          // safely, I think here we'd need "existential types", but that'd
-          // currently add a lot of boilerplate. All this applies to storage too.
-          // See https://unsafe-perform.io/posts/2020-02-21-existential-quantification-in-typescript
-          const [context, storage]: [any, any] = await Promise.all([
-            db.createContext(),
-            db.createStorage(),
-          ]);
+      const { scriptsDirectory, supportedScriptFormats } = db;
+      const env = getEnv({ db: dbName, env: envOptValue });
 
-          const migrator = new Umzug({
-            migrations: async (context) => {
-              const supportedExtensions =
-                supportedScriptFormats.length > 1
-                  ? `{${supportedScriptFormats.join(",")}}`
-                  : `${supportedScriptFormats[0]}`;
-              const matchingFilePaths = await globAsync(
-                `${scriptsDirectory}/*.${supportedExtensions}`,
-                { absolute: true }
-              );
+      // Every database can (and will) define a different context type. TS
+      // just types this return type as the intersection of all the possible
+      // context types, which isn't meaningful; what we want instead is for it
+      // to track that, for this particular db, there's some context type that
+      // matches the type expected by this particular db's resolveMigrations()
+      // function, but TS can't do that, so we cast to any. To do this more
+      // safely, I think here we'd need "existential types", but that'd
+      // currently add a lot of boilerplate. All this applies to storage too.
+      // See https://unsafe-perform.io/posts/2020-02-21-existential-quantification-in-typescript
+      const [context, storage]: [any, any] = await Promise.all([
+        db.createContext(env),
+        db.createStorage(env),
+      ]);
 
-              return matchingFilePaths
-                .filter(shouldRun.bind(null, env, supportedScriptFormats))
-                .map((unresolvedPath) => {
-                  const filepath = path.resolve(unresolvedPath);
-                  const name = path.basename(filepath);
-                  return {
-                    path: filepath,
-                    ...db.resolveScript({
-                      name,
-                      path: filepath,
-                      context,
-                    }),
-                  };
-                });
-            },
-            context,
-            storage,
-            logger: console,
-          });
+      const migrator = new Umzug({
+        migrations: async (context) => {
+          const supportedExtensions =
+            supportedScriptFormats.length > 1
+              ? `{${supportedScriptFormats.join(",")}}`
+              : `${supportedScriptFormats[0]}`;
+          const matchingFilePaths = await globAsync(
+            `${scriptsDirectory}/*.${supportedExtensions}`,
+            { absolute: true }
+          );
 
-          try {
-            switch (target) {
-              case "remaining":
-                await migrator.up();
-                break;
-              case "next":
-                await migrator.up({ step: 1 });
-                break;
-              case "only":
-                await migrator.up({ migrations: [name!] });
-                break;
-              case "until":
-                await migrator.up({ to: name! });
-            }
-          } finally {
-            // Await not return so that any errors from the try aren't swallowed.
-            await db.destroyContext(context);
-            if ("destroyStorage" in db) {
-              await db.destroyStorage?.(storage);
-            }
-          }
-        });
+          return matchingFilePaths
+            .filter(shouldRun.bind(null, env, supportedScriptFormats))
+            .map((unresolvedPath) => {
+              const filepath = path.resolve(unresolvedPath);
+              const name = path.basename(filepath);
+              return {
+                path: filepath,
+                ...db.resolveScript({
+                  name,
+                  path: filepath,
+                  context,
+                }),
+              };
+            });
+        },
+        context,
+        storage,
+        logger: console,
+      });
 
-      // Run in sequence so that the logs don't get interleaved (easier to follow).
-      return migrationTasks.reduce(
-        (res, task) => res.then(task),
-        Promise.resolve()
-      );
+      try {
+        switch (target) {
+          case "remaining":
+            await migrator.up();
+            break;
+          case "next":
+            await migrator.up({ step: 1 });
+            break;
+          case "only":
+            await migrator.up({ migrations: [name!] });
+            break;
+          case "until":
+            await migrator.up({ to: name! });
+        }
+      } finally {
+        // Await not return so that any errors from the try aren't swallowed.
+        await db.destroyContext(context);
+        if ("destroyStorage" in db) {
+          await db.destroyStorage?.(storage);
+        }
+      }
     },
   })
   .command({
     command: "clean",
-    describe:
-      "Deletes all the data in the databases specified in the ENV vars.",
+    describe: "Deletes all the data in the given env of the given database.",
     builder: (yargs) => {
       return yargs
         .option("db", dbOpt)
-        .option("env", {
-          ...envOpt,
-          demand:
-            "Must provide an environment (even though it has no effect; the " +
-            "connection-related env vars determine which db(s) are cleaned) " +
-            "to help prevent accidentally deleting prod!",
-        })
+        .option("env", { ...envOpt, demand: true })
         .check((opts) => {
-          return opts.env !== "prod";
+          const db = dbs[opts.db]!;
+          const env = getEnv(opts);
+          if (!db.supportedEnvironments.includes(env)) {
+            throw makeInvalidEnvironmentError(db, env);
+          }
+          return true;
         });
     },
-    handler: async ({ db: optDbs }) => {
-      await Promise.all(
-        Object.entries(dbs)
-          .filter(([dbName, _]) => optDbs.includes(dbName))
-          .map(async ([_, db]) => {
-            const { dropDbAndDisconnect, prepareDbAndDisconnect } = db;
-            // If drop fails, assume the db didn't exist, for convenience, and
-            // just move on to attempting the create. If the error was something
-            // different, then the create will fail, as `prepareDbAndDisconnect`
-            // is defined to throw if the db already exists, so this seems fine.
-            await dropDbAndDisconnect().catch(() => {});
-            await prepareDbAndDisconnect();
-          })
-      );
+    handler: async (opts) => {
+      const db = dbs[opts.db]!;
+
+      const { dropDbAndDisconnect, prepareDbAndDisconnect } = db;
+      const env = getEnv(opts);
+
+      // If drop fails, assume the db didn't exist, for convenience, and
+      // just move on to attempting the create. If the error was something
+      // different, then the create will fail, as `prepareDbAndDisconnect`
+      // is defined to throw if the db already exists, so this seems fine.
+      await dropDbAndDisconnect(env).catch(() => {});
+      await prepareDbAndDisconnect(env);
     },
   })
   .command({
     command: "drop",
-    describe: "Drops the databases specified in the ENV vars.",
+    describe: "Drops the given env of the given database.",
     builder: (yargs) => {
       return yargs
         .option("db", dbOpt)
-        .option("env", {
-          ...envOpt,
-          demand:
-            "Must provide an environment (even though it has no effect; the " +
-            "connection-related env vars determine which db(s) are dropped) " +
-            "to help prevent accidentally deleting prod!",
-        })
+        .option("env", { ...envOpt, demand: true })
         .check((opts) => {
-          return opts.env !== "prod";
+          const db = dbs[opts.db]!;
+          const env = getEnv(opts);
+          if (!db.supportedEnvironments.includes(env)) {
+            throw makeInvalidEnvironmentError(db, env);
+          }
+          return true;
         });
     },
-    handler: async ({ db: optDbs }) => {
-      await Promise.all(
-        Object.entries(dbs)
-          .filter(([dbName, _]) => optDbs.includes(dbName))
-          .map(([_, db]) => db.dropDbAndDisconnect())
-      );
+    handler: async (opts) => {
+      const db = dbs[opts.db]!;
+      const env = getEnv(opts);
+      await db.dropDbAndDisconnect(env);
     },
   })
   .command({
     command: "create",
-    describe: "Creates the databases specified in the config for this db name.",
+    describe: "Creates the given env of the given database.",
     builder: (yargs) => {
-      return yargs.option("db", dbOpt);
+      return yargs
+        .option("db", dbOpt)
+        .option("env", { ...envOpt, demand: true })
+        .check((opts) => {
+          const db = dbs[opts.db]!;
+          const env = getEnv(opts);
+          if (!db.supportedEnvironments.includes(env)) {
+            throw makeInvalidEnvironmentError(db, env);
+          }
+          return true;
+        });
     },
-    handler: async ({ db: optDbs }) => {
-      await Promise.all(
-        Object.entries(dbs)
-          .filter(([dbName, _]) => optDbs.includes(dbName))
-          .map(([_, db]) => db.prepareDbAndDisconnect())
-      );
+    handler: async (opts) => {
+      const db = dbs[opts.db]!;
+      const env = getEnv(opts);
+      await db.prepareDbAndDisconnect(env);
     },
   })
   .demandCommand(1, 'Must invoke a command (e.g., "clean" or "migrate")')
   .parse();
+
+function makeInvalidEnvironmentError(db: DatabaseConfig, env: string) {
+  return new Error(
+    `Environment "${env}" is not a valid environment. Valid environments are: ${db.supportedEnvironments.join(
+      ", "
+    )}.`
+  );
+}
+
+/**
+ * Workaround for https://github.com/yargs/yargs/issues/793
+ */
+function getEnv(argv: { db: string; env: string }): string;
+function getEnv(argv: {
+  db: string;
+  env: string | undefined;
+}): string | undefined;
+function getEnv(argv: {
+  db: string;
+  env: string | undefined;
+}): string | undefined {
+  const db = dbs[argv.db]!;
+  return argv.env ?? db.defaultEnvironment;
+}
