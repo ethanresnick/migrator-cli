@@ -6,6 +6,22 @@ import {
 
 type ReadonlyNonEmptyArray<T> = readonly [T, ...T[]];
 
+export type MigrationStorage<Ctx = unknown> = UmzugStorage<Ctx>;
+
+/**
+ * Result of generating a snapshot from a set of scripts. Note that we do not
+ * generate a separate migration for just the schema, and another for the env,
+ * as it's quite possible that an env-specific migration (occassionally) needs
+ * to do some DDL, so we can't even separate out the cross-env stuff from the
+ * env-specific things reliably. Also, some databases may not even have this
+ * schema concept.
+ */
+export type SnapshotResult = {
+  migrationScriptContent: string;
+  /** File extension without leading dot (e.g., 'sql', 'cjs') */
+  format: string;
+};
+
 /**
  * Every database for which we want to support migrations must provide a config
  * object for itself that satisfies this type.
@@ -18,7 +34,7 @@ export type DatabaseConfig<
   SupportedEnvironment extends string = string,
   SupportedScriptFormat extends string = string,
   ContextType = unknown,
-  StorageType extends UmzugStorage = UmzugStorage
+  StorageType extends UmzugStorage = UmzugStorage,
 > = {
   /**
    * The file type (i.e., extension) to use for a new script when a file type
@@ -54,7 +70,13 @@ export type DatabaseConfig<
    * database.
    */
   resolveScript(
-    params: MigrationParams<ContextType> & { path: string }
+    this: DatabaseConfig<
+      SupportedEnvironment,
+      SupportedScriptFormat,
+      ContextType,
+      StorageType
+    >,
+    params: MigrationParams<ContextType> & { path: string },
   ): RunnableMigration<ContextType>;
 
   /**
@@ -87,7 +109,7 @@ export type DatabaseConfig<
    * the scripts that have run, and removing the record of a script (if it's
    * rolled back).
    */
-  createStorage(env: SupportedEnvironment): UmzugStorage<ContextType>;
+  createStorage(env: SupportedEnvironment): MigrationStorage<ContextType>;
 
   /**
    * A function that destroys the context object and cleans up associated
@@ -104,4 +126,27 @@ export type DatabaseConfig<
    * be closed so the process can exit.
    */
   destroyStorage?(storage: StorageType): Promise<void>;
+
+  /**
+   * Generates a snapshot from a set of scripts. When applied to a fresh
+   * database, the snapshot should produce the same state as applying all the
+   * provided scripts in order.
+   *
+   * This method is optional; not all database adapters need to support it.
+   *
+   * Implementations should ideally include a comment at the top of generated
+   * files listing the scripts that the snapshot replaces.
+   */
+  generateSnapshot?(
+    this: DatabaseConfig<
+      SupportedEnvironment,
+      SupportedScriptFormat,
+      ContextType,
+      StorageType
+    >,
+    scripts: Array<{ path: string; name: string }>,
+    // Will be undefined when we're generating a snapshot
+    // just from the scripts that are not env-specific.
+    env?: SupportedEnvironment,
+  ): Promise<SnapshotResult>;
 };

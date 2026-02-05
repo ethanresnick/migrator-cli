@@ -1,22 +1,38 @@
 #!/usr/bin/env node
-import glob from "glob";
 import path from "path";
-import { promisify } from "util";
 
+import type { CollapseCases } from "type-party";
 import { Umzug } from "umzug";
 import yargs, { type Options } from "yargs";
 
 import type { DatabaseConfig } from "./DatabaseConfig.js";
-import { nameScript, scriptTypes, shouldRun } from "./script-generator.js";
+import {
+  nameScript,
+  toValidEnvName,
+  toValidScriptFormat,
+  toValidScriptName,
+  type ParsedScriptMetadata,
+} from "./script-name-parsing/index.js";
+import {
+  findScriptsToRun,
+  loadSortedScripts,
+  scriptTypes,
+} from "./script-utils.js";
+import { catchUpToSnapshot } from "./snapshotting/catch-up-to-snapshot.js";
+import { createSnapshotAndArchiveCoveredScripts } from "./snapshotting/create-snapshot.js";
+import { toAbsolutePath, toFileBaseName } from "./utils.js";
 
-const globAsync = promisify(glob);
+type MigratorConfig = {
+  databases: { [k: string]: DatabaseConfig };
+  snapshotArchivesDirectory?: string;
+};
 
-const dbs = await (async (): Promise<{ [k: string]: DatabaseConfig }> => {
+const config = await (async (): Promise<MigratorConfig> => {
   try {
     const { default: config } = await import(
       path.resolve(process.cwd(), "./.migrator.config.mjs")
     );
-    return config.databases;
+    return config;
   } catch (e) {
     if ((e as any)?.code != "ERR_MODULE_NOT_FOUND") {
       throw e;
@@ -26,16 +42,20 @@ const dbs = await (async (): Promise<{ [k: string]: DatabaseConfig }> => {
       const { default: config } = await import(
         path.resolve(process.cwd(), "./.migrator.config.js")
       );
-      return config.databases;
+      return config;
     } catch (e) {
       throw (e as any)?.code != "ERR_MODULE_NOT_FOUND"
         ? e
         : new Error(
-            "Could not find .migrator.config.mjs or .migrator.config.js in current directory"
+            "Could not find .migrator.config.mjs or .migrator.config.js in current directory",
           );
     }
   }
 })();
+
+const dbs = config.databases;
+const snapshotArchivesDirectory =
+  config.snapshotArchivesDirectory ?? "./snapshot-archives";
 
 const dbOpt = {
   alias: "database",
@@ -90,14 +110,14 @@ yargs(process.argv.slice(2))
           if (opts.type === "seed" && !opts.env) {
             throw new Error(
               "Environment is required when adding a seed file, to indicate" +
-                "in which environment the seed should be applied."
+                "in which environment the seed should be applied.",
             );
           }
 
           if (opts.type === "migration" && opts.env) {
             throw new Error(
               "You cannot provide an environment when creating a migration; " +
-                "every migration is run in every environment for schema consistency."
+                "every migration is run in every environment for schema consistency.",
             );
           }
 
@@ -112,7 +132,7 @@ yargs(process.argv.slice(2))
             !db.supportedScriptFormats.includes(opts.format)
           ) {
             throw new Error(
-              `The db "${opts.db}" doesn't support .${opts.format} files as scripts.`
+              `The db "${opts.db}" doesn't support .${opts.format} files as scripts.`,
             );
           }
 
@@ -147,9 +167,15 @@ yargs(process.argv.slice(2))
       const format = formatOptValue ?? defaultScriptFormat;
 
       await migrator.create({
-        name: `${nameScript(type, env, name)}.${format}`,
+        name: nameScript({
+          date: new Date(),
+          type,
+          env: env ? toValidEnvName(env) : undefined,
+          name: toValidScriptName(name, false),
+          format: toValidScriptFormat(format),
+        } satisfies CollapseCases<ParsedScriptMetadata> as ParsedScriptMetadata),
         allowExtension: `.${format}`,
-        prefix: "TIMESTAMP",
+        prefix: "NONE",
         // skipVerify lets us run this command without an active db connection,
         // at least for pg, which is a bit safer. It will prevent umzug from
         // checking that we haven't already run a migration with the same name,
@@ -188,13 +214,13 @@ yargs(process.argv.slice(2))
             throw new Error(
               "Can't provide a general script/set of scripts to run (with " +
                 '"next" or "remaining") and then also provide the name of a ' +
-                "specific script."
+                "specific script.",
             );
           }
           if (needsSpecificScript && !name) {
             throw new Error(
               'Must provide a script name when you use "only"/"until" to ' +
-                "apply (only or up to) a specific script."
+                "apply (only or up to) a specific script.",
             );
           }
 
@@ -210,8 +236,8 @@ yargs(process.argv.slice(2))
     handler: async function ({ target, name, env: envOptValue, db: dbName }) {
       const db = dbs[dbName]!;
 
-      const { scriptsDirectory, supportedScriptFormats } = db;
-      const env = getEnv({ db: dbName, env: envOptValue });
+      const { scriptsDirectory } = db;
+      const env = toValidEnvName(getEnv({ db: dbName, env: envOptValue }));
 
       // Every database can (and will) define a different context type. TS
       // just types this return type as the intersection of all the possible
@@ -227,31 +253,39 @@ yargs(process.argv.slice(2))
         db.createStorage(env),
       ]);
 
-      const migrator = new Umzug({
-        migrations: async (context) => {
-          const supportedExtensions =
-            supportedScriptFormats.length > 1
-              ? `{${supportedScriptFormats.join(",")}}`
-              : `${supportedScriptFormats[0]}`;
-          const matchingFilePaths = await globAsync(
-            `${scriptsDirectory}/*.${supportedExtensions}`,
-            { absolute: true }
-          );
+      const sortedScripts = await loadSortedScripts(
+        scriptsDirectory,
+        db.supportedScriptFormats.map(toValidScriptFormat),
+      );
+      const resolveScript = db.resolveScript.bind(db);
 
-          return matchingFilePaths
-            .filter(shouldRun.bind(null, env, supportedScriptFormats))
-            .map((unresolvedPath) => {
-              const filepath = path.resolve(unresolvedPath);
-              const name = path.basename(filepath);
-              return {
+      await catchUpToSnapshot({
+        env,
+        sortedScripts,
+        snapshotArchivesDirectory: toAbsolutePath(snapshotArchivesDirectory),
+        supportedScriptFormats:
+          db.supportedScriptFormats.map(toValidScriptFormat),
+        storage,
+        context,
+        resolveScript,
+      });
+
+      const migrator = new Umzug({
+        migrations: async (ctx) => {
+          return findScriptsToRun({
+            sortedScriptSet: sortedScripts.scriptNames,
+            env,
+          }).map((name) => {
+            const filepath = path.resolve(sortedScripts.scriptDirectory, name);
+            return {
+              path: filepath,
+              ...resolveScript({
+                name: name,
                 path: filepath,
-                ...db.resolveScript({
-                  name,
-                  path: filepath,
-                  context,
-                }),
-              };
-            });
+                context: ctx,
+              }),
+            };
+          });
         },
         context,
         storage,
@@ -355,14 +389,82 @@ yargs(process.argv.slice(2))
       await db.prepareDbAndDisconnect(env);
     },
   })
+  .command({
+    command: "snapshot",
+    describe:
+      "Creates snapshots for all environments: one schema migration (shared) " +
+      "and one seed data migration per environment. " +
+      "Original scripts are moved to an archive folder for integrity verification.",
+    builder: (yargs) => {
+      return yargs
+        .option("db", dbOpt)
+        .option("up-to", {
+          describe:
+            "Include scripts up to this script name or timestamp prefix (e.g., 2024.02.04T19.00.00 or 2024.02.04T19.00.00.add-x.sql). Defaults to all scripts.",
+          type: "string",
+          demandOption: false,
+        })
+        .check((opts) => {
+          const db = dbs[opts.db]!;
+
+          if (!db.supportedEnvironments) {
+            throw new Error(
+              `Database "${opts.db}" does not define supportedEnvironments. ` +
+                `Please update your database config.`,
+            );
+          }
+
+          if (!db.generateSnapshot) {
+            throw new Error(
+              `Database "${opts.db}" does not support snapshot generation.`,
+            );
+          }
+
+          return true;
+        });
+    },
+    handler: async (opts) => {
+      const db = dbs[opts.db]!;
+      const {
+        scriptsDirectory,
+        supportedEnvironments,
+        supportedScriptFormats,
+      } = db;
+
+      // Get ALL scripts on disk (for all envs)
+      const sortedScripts = await loadSortedScripts(
+        scriptsDirectory,
+        supportedScriptFormats.map(toValidScriptFormat),
+      );
+
+      try {
+        const upTo = opts["up-to"];
+        await createSnapshotAndArchiveCoveredScripts({
+          sortedScripts,
+          snapshotArchivesDirectory: toAbsolutePath(snapshotArchivesDirectory),
+          supportedEnvironments: supportedEnvironments.map(toValidEnvName),
+          // Must bind to db because the method uses `this` internally
+          generateSnapshot: db.generateSnapshot!.bind(db),
+          ...(upTo !== undefined && { upTo: toFileBaseName(upTo) }),
+          logger: console,
+        });
+      } catch (e) {
+        if (e instanceof Error && e.message === "No scripts to snapshot") {
+          console.log("No scripts to snapshot.");
+          return;
+        }
+        throw e;
+      }
+    },
+  })
   .demandCommand(1, 'Must invoke a command (e.g., "clean" or "migrate")')
   .parse();
 
 function makeInvalidEnvironmentError(db: DatabaseConfig, env: string) {
   return new Error(
     `Environment "${env}" is not a valid environment. Valid environments are: ${db.supportedEnvironments.join(
-      ", "
-    )}.`
+      ", ",
+    )}.`,
   );
 }
 
