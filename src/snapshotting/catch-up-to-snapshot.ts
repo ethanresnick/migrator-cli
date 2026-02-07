@@ -251,6 +251,11 @@ export async function catchUpToSnapshot<Context>(opts: {
   // Get executed scripts
   const executedScripts = await storage.executed({ context });
 
+  // If the snapshot is already applied, do nothing
+  if (executedScripts.includes(snapshotScriptForEnv)) {
+    return;
+  }
+
   // Check if upTo is before the snapshot (invalid - can't skip the snapshot)
   if (
     upTo !== undefined &&
